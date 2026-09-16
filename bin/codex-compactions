@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""Summarize local Codex sessions and their context compactions."""
+
+import argparse
+import datetime as datetime_module
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+import unicodedata
+
+
+DEFAULT_LIMIT = 100
+ANSI_BOLD = "\033[1m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+ANSI_RESET = "\033[0m"
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SESSION_ID_PATTERN = re.compile(
+    r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$"
+)
+
+
+@dataclass
+class Session:
+    session_id: str
+    rollout_path: Path
+    updated_at: float
+    archived: bool = False
+    database_name: Optional[str] = None
+    database_title: Optional[str] = None
+    name: Optional[str] = None
+    compactions: Optional[int] = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Show terminal-attached Codex sessions and compaction counts."
+    )
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--session",
+        metavar="SESSION_ID",
+        help="show only the session with this ID",
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="colorize compaction counts (default: auto)",
+    )
+    return parser.parse_args()
+
+
+def codex_home() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".codex"
+
+
+def index_timestamp(value: object) -> float:
+    if not isinstance(value, str):
+        return float("-inf")
+    try:
+        return datetime_module.datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        ).timestamp()
+    except ValueError:
+        return float("-inf")
+
+
+def load_latest_names(index_path: Path) -> Dict[str, str]:
+    latest: Dict[str, Tuple[float, int, str]] = {}
+    try:
+        lines = index_path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    with lines:
+        for line_number, line in enumerate(lines, 1):
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            session_id = record.get("id")
+            name = record.get("thread_name")
+            if (
+                not isinstance(session_id, str)
+                or not isinstance(name, str)
+                or not name.strip()
+            ):
+                continue
+            candidate = (index_timestamp(record.get("updated_at")), line_number, name)
+            if session_id not in latest or candidate[:2] >= latest[session_id][:2]:
+                latest[session_id] = candidate
+
+    return {session_id: value[2] for session_id, value in latest.items()}
+
+
+def load_sessions_from_database(home: Path) -> List[Session]:
+    database = home / "state_5.sqlite"
+    if not database.is_file():
+        return []
+
+    try:
+        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(threads)")
+        }
+        if not {"id", "rollout_path"}.issubset(columns):
+            connection.close()
+            return []
+
+        optional = {
+            "updated_at": "updated_at" if "updated_at" in columns else "0",
+            "updated_at_ms": "updated_at_ms" if "updated_at_ms" in columns else "0",
+            "archived": "archived" if "archived" in columns else "0",
+            "name": "name" if "name" in columns else "NULL",
+            "title": "title" if "title" in columns else "NULL",
+        }
+        query = """
+            SELECT id, rollout_path,
+                   {updated_at} AS updated_at,
+                   {updated_at_ms} AS updated_at_ms,
+                   {archived} AS archived,
+                   {name} AS name,
+                   {title} AS title
+              FROM threads
+        """.format(**optional)
+        rows = list(connection.execute(query))
+        connection.close()
+    except sqlite3.Error:
+        return []
+
+    sessions = []
+    for row in rows:
+        path = Path(row["rollout_path"]).expanduser()
+        if not path.is_file():
+            continue
+        database_updated = float(row["updated_at_ms"] or 0) / 1000
+        if not database_updated:
+            database_updated = float(row["updated_at"] or 0)
+        try:
+            file_updated = path.stat().st_mtime
+        except OSError:
+            file_updated = 0
+        sessions.append(
+            Session(
+                session_id=row["id"],
+                rollout_path=path,
+                updated_at=max(database_updated, file_updated),
+                archived=bool(row["archived"]),
+                database_name=row["name"],
+                database_title=row["title"],
+            )
+        )
+    return sessions
+
+
+def session_id_from_path(path: Path) -> Optional[str]:
+    match = SESSION_ID_PATTERN.search(path.name)
+    return match.group(1) if match else None
+
+
+def load_sessions_from_rollouts(home: Path) -> List[Session]:
+    paths = list((home / "sessions").glob("*/*/*/rollout-*.jsonl"))
+
+    sessions = []
+    for path in paths:
+        session_id = session_id_from_path(path)
+        if not session_id:
+            continue
+        try:
+            updated_at = path.stat().st_mtime
+        except OSError:
+            continue
+        sessions.append(
+            Session(
+                session_id=session_id,
+                rollout_path=path,
+                updated_at=updated_at,
+                archived=False,
+            )
+        )
+    return sessions
+
+
+def clean_name(value: str) -> str:
+    value = ANSI_ESCAPE_PATTERN.sub("", value)
+    printable = "".join(
+        character if unicodedata.category(character) != "Cc" else " "
+        for character in value
+    )
+    return " ".join(printable.split())
+
+
+def friendly_title(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    for line in value.splitlines():
+        candidate = clean_name(line).lstrip("# ")
+        if not candidate:
+            continue
+        if candidate in {"---BEGIN PROMPT---", "---END PROMPT---"}:
+            continue
+        if candidate.startswith("[Generated by:"):
+            continue
+        return candidate
+    return None
+
+
+def rollout_title(path: Path) -> Optional[str]:
+    try:
+        lines = path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    with lines:
+        for line_number, line in enumerate(lines):
+            if line_number > 200:
+                break
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            is_user_message = (
+                payload.get("role") == "user"
+                or payload.get("type") == "user_message"
+            )
+            if not is_user_message:
+                continue
+            for value in (
+                payload.get("message"),
+                payload.get("text"),
+                payload.get("content"),
+            ):
+                text = extract_text(value)
+                if text:
+                    return friendly_title(text)
+    return None
+
+
+def extract_text(value: object) -> Optional[str]:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            text = extract_text(item)
+            if text:
+                return text
+    if isinstance(value, dict):
+        for key in ("text", "content", "message"):
+            text = extract_text(value.get(key))
+            if text:
+                return text
+    return None
+
+
+def assign_name(session: Session, indexed_names: Dict[str, str]) -> None:
+    name = indexed_names.get(session.session_id)
+    if not name:
+        name = session.database_name
+    if not name:
+        name = friendly_title(session.database_title)
+    if not name:
+        name = rollout_title(session.rollout_path)
+    if not name:
+        name = f"Unnamed session (...{session.session_id[-8:]})"
+    session.name = clean_name(name)
+
+
+def count_compactions(path: Path) -> Optional[int]:
+    count = 0
+    try:
+        lines = path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with lines:
+        for line in lines:
+            if "compacted" not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if record.get("type") == "compacted":
+                count += 1
+    return count
+
+
+def terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
+    lsof = shutil.which("lsof")
+    ps = shutil.which("ps")
+    path_list = [str(path.resolve()) for path in paths]
+    if not lsof or not ps:
+        return None
+    if not path_list:
+        return set()
+
+    try:
+        lsof_result = subprocess.run(
+            [lsof, "-Fpcn", "--", *path_list],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        ps_result = subprocess.run(
+            [ps, "-axo", "pid=,tty="],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    except subprocess.CalledProcessError:
+        return None
+
+    terminals: Dict[int, str] = {}
+    for line in ps_result.stdout.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) == 2 and fields[0].isdigit():
+            terminals[int(fields[0])] = fields[1]
+
+    records: Dict[int, Tuple[str, Set[Path]]] = {}
+    current_pid: Optional[int] = None
+    for line in lsof_result.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            current_pid = int(line[1:])
+            records.setdefault(current_pid, ("", set()))
+        elif line.startswith("c") and current_pid is not None:
+            records[current_pid] = (line[1:], records[current_pid][1])
+        elif line.startswith("n") and current_pid is not None:
+            records[current_pid][1].add(Path(line[1:]).resolve())
+
+    attached: Set[Path] = set()
+    for pid, (command, open_paths) in records.items():
+        terminal = terminals.get(pid, "??")
+        if command.startswith("codex") and terminal not in {"?", "??", "-"}:
+            attached.update(open_paths)
+    return attached
+
+
+def relative_time(timestamp: float, now: datetime_module.datetime) -> str:
+    then = datetime_module.datetime.fromtimestamp(timestamp).astimezone()
+    seconds = max(0, int((now - then).total_seconds()))
+    if seconds < 60:
+        return "just now"
+    if seconds < 120:
+        return "1 min ago"
+    if seconds < 3600:
+        return f"{seconds // 60} min ago"
+    if seconds < 7200:
+        return "1 hour ago"
+    if seconds < 24 * 3600:
+        return f"{seconds // 3600} hours ago"
+    if then.date() == now.date() - datetime_module.timedelta(days=1):
+        return "yesterday"
+    if seconds < 7 * 24 * 3600:
+        days = seconds // (24 * 3600)
+        return "1 day ago" if days == 1 else f"{days} days ago"
+    date = f"{then.strftime('%b')} {then.day}"
+    return date if then.year == now.year else f"{date}, {then.year}"
+
+
+def truncate(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return value[: width - 3] + "..."
+
+
+def color_enabled(setting: str) -> bool:
+    if setting == "always":
+        return True
+    if setting == "never":
+        return False
+    return (
+        sys.stdout.isatty()
+        and os.environ.get("TERM") != "dumb"
+        and "NO_COLOR" not in os.environ
+    )
+
+
+def color_compaction(value: str, count: Optional[int], enabled: bool) -> str:
+    if not enabled or count is None:
+        return value
+    if count <= 5:
+        color = ANSI_GREEN
+    elif count <= 11:
+        color = ANSI_YELLOW
+    else:
+        color = ANSI_RED
+    return f"{color}{value}{ANSI_RESET}"
+
+
+def print_sessions(sessions: List[Session], use_color: bool) -> None:
+    now = datetime_module.datetime.now().astimezone()
+    updated_values = [relative_time(session.updated_at, now) for session in sessions]
+    compact_values = [
+        "?" if session.compactions is None else str(session.compactions)
+        for session in sessions
+    ]
+    updated_width = max([len("UPDATED"), *(len(value) for value in updated_values)])
+    compact_width = max([len("COMPACT"), *(len(value) for value in compact_values)])
+
+    fixed_width = compact_width + 2 + updated_width + 2
+    terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
+    name_width = max(20, terminal_width - fixed_width)
+
+    header = (
+        f"{'COMPACT':>{compact_width}}  "
+        f"{'UPDATED':<{updated_width}}  SESSION"
+    )
+    print(f"{ANSI_BOLD}{header}{ANSI_RESET}" if use_color else header)
+    for session, updated, compact in zip(sessions, updated_values, compact_values):
+        compact_cell = color_compaction(
+            f"{compact:>{compact_width}}", session.compactions, use_color
+        )
+        print(
+            f"{compact_cell}  {updated:<{updated_width}}  "
+            f"{truncate(session.name or '', name_width)}"
+        )
+
+
+def main() -> int:
+    args = parse_args()
+    home = codex_home()
+    if not home.is_dir():
+        print(f"codex-compactions: Codex home does not exist: {home}", file=sys.stderr)
+        return 1
+
+    sessions = load_sessions_from_database(home)
+    if not sessions:
+        sessions = load_sessions_from_rollouts(home)
+
+    sessions = [session for session in sessions if not session.archived]
+    sessions.sort(key=lambda session: session.updated_at, reverse=True)
+    attached = terminal_attached_paths(session.rollout_path for session in sessions)
+    if attached is None:
+        print(
+            "codex-compactions: cannot detect attached sessions; lsof and ps are required",
+            file=sys.stderr,
+        )
+        return 1
+    sessions = [
+        session
+        for session in sessions
+        if session.rollout_path.resolve() in attached
+    ]
+
+    selected_id = args.session
+    if selected_id:
+        selected = [
+            session for session in sessions if session.session_id == selected_id
+        ]
+        if not selected:
+            print(
+                f"codex-compactions: session {selected_id} is not terminal-attached",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        selected = sessions
+
+    if not selected:
+        print("No terminal-attached Codex sessions found.")
+        return 0
+
+    indexed_names = load_latest_names(home / "session_index.jsonl")
+    for session in selected:
+        assign_name(session, indexed_names)
+
+    if not selected_id:
+        selected.sort(
+            key=lambda session: (
+                (session.name or "").casefold(),
+                -session.updated_at,
+            )
+        )
+        selected = selected[:DEFAULT_LIMIT]
+
+    for session in selected:
+        session.compactions = count_compactions(session.rollout_path)
+
+    print_sessions(selected, color_enabled(args.color))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
