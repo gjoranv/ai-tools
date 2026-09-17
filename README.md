@@ -23,6 +23,28 @@ heuristic: green for 0-5 compactions, yellow for 6-11, and red for 12 or more.
 Colors are disabled automatically when output is redirected or piped. Use
 `--color always` or `--color never` to override detection.
 
+### Using the skill in Codex
+
+After installing the skill, ask naturally from a Codex session:
+
+```text
+How many times has this session been compacted?
+```
+
+To invoke the skill explicitly, include its name:
+
+```text
+$codex-compactions
+```
+
+The skill supplies the current session ID to the command and reports the
+compaction count with guidance for the green, yellow, or red range. It can also
+summarize every terminal-attached session:
+
+```text
+Use $codex-compactions to summarize my terminal-attached Codex sessions.
+```
+
 ## Installation
 
 The tool requires macOS, Python 3, `lsof`, and `ps`. From the repository root,
