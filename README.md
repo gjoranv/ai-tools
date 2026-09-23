@@ -6,8 +6,8 @@ Tools and scripts related to AI agents.
 
 `bin/codex-compactions` summarizes local Codex sessions by human-readable name,
 last activity, and context compaction count. It shows only sessions attached to
-a terminal. It uses the Python standard library plus the standard macOS `lsof`
-and `ps` commands.
+a terminal. It uses the Python standard library, plus `/proc` on Linux or the
+standard `lsof` and `ps` commands on macOS.
 
 ```console
 bin/codex-compactions
@@ -47,20 +47,24 @@ Use $codex-compactions to summarize my terminal-attached Codex sessions.
 
 ## Installation
 
-The tool requires macOS, Python 3, `lsof`, and `ps`. From the repository root,
-link the executable and skill into user-wide locations:
+The tool requires Python 3 and supports Linux and macOS. Linux uses the standard
+`/proc` filesystem without additional tools. macOS uses the standard `lsof` and
+`ps` commands. Native Windows is not supported.
+
+Choose a user-writable executable directory on `PATH`. The example below uses
+the common `~/.local/bin` location. From the repository root, link the
+executable and skill into their user-wide locations:
 
 ```sh
-mkdir -p "$HOME/bin" "$HOME/.agents/skills"
-ln -sfn "$PWD/bin/codex-compactions" "$HOME/bin/codex-compactions"
-ln -sfn "$PWD/skills/codex-compactions" \
-  "$HOME/.agents/skills/codex-compactions"
+mkdir -p "$HOME/.local/bin" "$HOME/.agents/skills"
+ln -sfn "$PWD/bin/codex-compactions" "$HOME/.local/bin/codex-compactions"
+ln -sfn "$PWD/skills/codex-compactions" "$HOME/.agents/skills/codex-compactions"
 ```
 
-Ensure `~/bin` is on `PATH`. Fish users can run:
+If `~/.local/bin` is not already on `PATH`, add this to your startup file:
 
-```fish
-fish_add_path $HOME/bin
+```sh
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 Codex normally detects skill changes automatically. Restart Codex if the skill
@@ -68,7 +72,7 @@ does not appear.
 
 ## Compatibility
 
-The current format support was verified with Codex CLI 0.154.0 on macOS. The
+The current format support was verified with Codex CLI 0.155.1 on macOS. The
 tool reads local session metadata and rollout files under `~/.codex`; it does
 not transmit them. These on-disk formats are implementation details and may
 change in future Codex releases.

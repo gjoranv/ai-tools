@@ -298,7 +298,70 @@ def count_compactions(path: Path) -> Optional[int]:
     return count
 
 
-def terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
+def linux_process_has_terminal(stat_path: Path) -> bool:
+    try:
+        stat = stat_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+    command_end = stat.rfind(")")
+    if command_end < 0:
+        return False
+    fields = stat[command_end + 1 :].split()
+    if len(fields) < 5:
+        return False
+    try:
+        return int(fields[4]) != 0
+    except ValueError:
+        return False
+
+
+def linux_terminal_attached_paths(
+    paths: Iterable[Path], proc_root: Path
+) -> Optional[Set[Path]]:
+    candidates = {path.resolve() for path in paths}
+    if not candidates:
+        return set()
+    if not proc_root.is_dir():
+        return None
+
+    try:
+        processes = list(proc_root.iterdir())
+    except OSError:
+        return None
+
+    attached: Set[Path] = set()
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            command = (process / "comm").read_text(
+                encoding="utf-8", errors="replace"
+            ).strip()
+        except OSError:
+            continue
+        if not command.startswith("codex"):
+            continue
+        if not linux_process_has_terminal(process / "stat"):
+            continue
+
+        try:
+            descriptors = list((process / "fd").iterdir())
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = descriptor.resolve(strict=True)
+            except OSError:
+                continue
+            if target in candidates:
+                attached.add(target)
+        if attached == candidates:
+            break
+    return attached
+
+
+def lsof_terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
     lsof = shutil.which("lsof")
     ps = shutil.which("ps")
     path_list = [str(path.resolve()) for path in paths]
@@ -350,6 +413,24 @@ def terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
         if command.startswith("codex") and terminal not in {"?", "??", "-"}:
             attached.update(open_paths)
     return attached
+
+
+def terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
+    path_list = list(paths)
+    if sys.platform.startswith("linux"):
+        proc_root = Path(os.environ.get("CODEX_COMPACTIONS_PROC_ROOT", "/proc"))
+        return linux_terminal_attached_paths(path_list, proc_root)
+    if sys.platform == "darwin":
+        return lsof_terminal_attached_paths(path_list)
+    return None
+
+
+def attachment_error() -> str:
+    if sys.platform.startswith("linux"):
+        return "cannot detect attached sessions; procfs is required at /proc"
+    if sys.platform == "darwin":
+        return "cannot detect attached sessions; lsof and ps are required"
+    return f"unsupported platform: {sys.platform}"
 
 
 def relative_time(timestamp: float, now: datetime_module.datetime) -> str:
@@ -450,10 +531,7 @@ def main() -> int:
     sessions.sort(key=lambda session: session.updated_at, reverse=True)
     attached = terminal_attached_paths(session.rollout_path for session in sessions)
     if attached is None:
-        print(
-            "codex-compactions: cannot detect attached sessions; lsof and ps are required",
-            file=sys.stderr,
-        )
+        print(f"codex-compactions: {attachment_error()}", file=sys.stderr)
         return 1
     sessions = [
         session

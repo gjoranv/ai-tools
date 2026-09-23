@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -46,8 +47,14 @@ class CodexSessionsTest(unittest.TestCase):
         environment["COLUMNS"] = "100"
         if attached_paths is None:
             attached_paths = self.rollouts
-        tool_directory = self.create_attachment_tools(attached_paths)
-        environment["PATH"] = f"{tool_directory}{os.pathsep}{environment['PATH']}"
+        if sys.platform.startswith("linux"):
+            proc_root = self.create_proc_tree(attached_paths)
+            environment["CODEX_COMPACTIONS_PROC_ROOT"] = str(proc_root)
+        else:
+            tool_directory = self.create_attachment_tools(attached_paths)
+            environment["PATH"] = (
+                f"{tool_directory}{os.pathsep}{environment['PATH']}"
+            )
         if extra_environment:
             environment.update(extra_environment)
         return subprocess.run(
@@ -73,6 +80,21 @@ class CodexSessionsTest(unittest.TestCase):
         lsof.chmod(0o755)
         ps.chmod(0o755)
         return tool_directory
+
+    def create_proc_tree(self, rollout_paths, directory="proc", tty_number=34817):
+        proc_root = self.home / directory
+        process = proc_root / "123"
+        descriptors = process / "fd"
+        descriptors.mkdir(parents=True, exist_ok=True)
+        (process / "comm").write_text("codex\n")
+        (process / "stat").write_text(
+            f"123 (codex) S 1 123 123 {tty_number} 0 0\n"
+        )
+        for descriptor, path in enumerate(rollout_paths, 3):
+            link = descriptors / str(descriptor)
+            if not link.exists():
+                link.symlink_to(path.resolve())
+        return proc_root
 
     def test_latest_rename_and_exact_compaction_records(self):
         session_id = str(uuid.uuid4())
@@ -297,6 +319,21 @@ class CodexSessionsTest(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertNotIn("\033[", result.stdout)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux-specific test")
+    def test_linux_ignores_codex_process_without_terminal(self):
+        session_id = str(uuid.uuid4())
+        rollout = self.create_rollout(session_id, [{"type": "session_meta"}])
+        proc_root = self.create_proc_tree(
+            [rollout], directory="proc-without-terminal", tty_number=0
+        )
+
+        result = self.run_script(
+            extra_environment={"CODEX_COMPACTIONS_PROC_ROOT": str(proc_root)}
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("No terminal-attached Codex sessions found.\n", result.stdout)
 
 
 if __name__ == "__main__":
