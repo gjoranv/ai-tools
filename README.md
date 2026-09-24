@@ -9,6 +9,8 @@ last activity, and context compaction count. It shows only sessions attached to
 a terminal. It uses the Python standard library, plus `/proc` on Linux or the
 standard `lsof` and `ps` commands on macOS.
 
+It reads Codex metadata and rollout files locally and makes no network requests.
+
 ```console
 bin/codex-compactions
 bin/codex-compactions --session "$CODEX_SESSION_ID"
@@ -18,10 +20,17 @@ The default view shows up to 100 terminal-attached sessions, sorted by session
 name, and no detached session. Run `bin/codex-compactions --help` for all
 options.
 
-In a terminal, the header is bold and the compaction count uses a local health
-heuristic: green for 0-5 compactions, yellow for 6-11, and red for 12 or more.
+The compaction count is color-coded as workflow guidance: green for 0-5
+compactions, yellow for 6-11, and red for 12 or more. Yellow suggests preparing
+a handoff if the session starts to drift; red suggests continuing in a fresh
+session when accumulated context matters. These are not official Codex limits.
 Colors are disabled automatically when output is redirected or piped. Use
 `--color always` or `--color never` to override detection.
+
+When the count suggests moving to a fresh session, use the
+`handover` skill from [`claude-plan-skills`](https://github.com/gjoranv/claude-plan-skills).
+It reviews the current repository and session state, offers to persist unfinished
+work, and generates a copy-pasteable prompt for continuing in a new session.
 
 ### Using the skill in Codex
 
@@ -73,6 +82,5 @@ does not appear.
 ## Compatibility
 
 The current format support was verified with Codex CLI 0.155.1 on macOS. The
-tool reads local session metadata and rollout files under `~/.codex`; it does
-not transmit them. These on-disk formats are implementation details and may
-change in future Codex releases.
+on-disk formats under `~/.codex` are implementation details and may change in
+future Codex releases.
