@@ -81,6 +81,8 @@ does not appear.
 
 ## Compatibility
 
-The current format support was verified with Codex CLI 0.155.1 on macOS. The
-on-disk formats under `~/.codex` are implementation details and may change in
-future Codex releases.
+The current format support was verified with Codex CLI 0.157.1 and its shared
+app-server daemon on macOS. For Codex 0.157 and later, daemon-loaded sessions
+are included only when their stored originator is `codex-tui`; sessions from
+Codex Desktop remain excluded. The on-disk formats under `~/.codex` are
+implementation details and may change in future Codex releases.

@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -41,17 +42,29 @@ class CodexSessionsTest(unittest.TestCase):
             for record in records:
                 output.write(json.dumps(record) + "\n")
 
-    def run_script(self, *arguments, attached_paths=None, extra_environment=None):
+    def run_script(
+        self,
+        *arguments,
+        attached_paths=None,
+        daemon_paths=None,
+        extra_environment=None,
+    ):
         environment = os.environ.copy()
         environment["CODEX_HOME"] = str(self.home)
         environment["COLUMNS"] = "100"
         if attached_paths is None:
             attached_paths = self.rollouts
+        if daemon_paths is None:
+            daemon_paths = []
         if sys.platform.startswith("linux"):
-            proc_root = self.create_proc_tree(attached_paths)
+            proc_root = self.create_proc_tree(
+                attached_paths, daemon_paths=daemon_paths
+            )
             environment["CODEX_COMPACTIONS_PROC_ROOT"] = str(proc_root)
         else:
-            tool_directory = self.create_attachment_tools(attached_paths)
+            tool_directory = self.create_attachment_tools(
+                attached_paths, daemon_paths=daemon_paths
+            )
             environment["PATH"] = (
                 f"{tool_directory}{os.pathsep}{environment['PATH']}"
             )
@@ -66,7 +79,9 @@ class CodexSessionsTest(unittest.TestCase):
             env=environment,
         )
 
-    def create_attachment_tools(self, rollout_paths):
+    def create_attachment_tools(self, rollout_paths, daemon_paths=None):
+        if daemon_paths is None:
+            daemon_paths = []
         tool_directory = self.home / "fake-tools"
         tool_directory.mkdir(exist_ok=True)
         lsof = tool_directory / "lsof"
@@ -74,27 +89,102 @@ class CodexSessionsTest(unittest.TestCase):
         lsof_lines.extend(
             f"print({('n' + str(path.resolve()))!r})" for path in rollout_paths
         )
+        if daemon_paths:
+            lsof_lines.extend(("print('p456')", "print('ccodex')"))
+            lsof_lines.extend(
+                f"print({('n' + str(path.resolve()))!r})" for path in daemon_paths
+            )
         lsof.write_text("\n".join(lsof_lines) + "\n")
         ps = tool_directory / "ps"
-        ps.write_text("#!/usr/bin/env python3\nprint(' 123 ttys001')\n")
+        ps_lines = [
+            "#!/usr/bin/env python3",
+            "print(' 123 ttys001 codex')",
+        ]
+        if daemon_paths:
+            ps_lines.append(
+                "print(' 456 ?? codex app-server --listen unix:// --managed-daemon')"
+            )
+        ps.write_text("\n".join(ps_lines) + "\n")
         lsof.chmod(0o755)
         ps.chmod(0o755)
         return tool_directory
 
-    def create_proc_tree(self, rollout_paths, directory="proc", tty_number=34817):
+    def create_proc_tree(
+        self,
+        rollout_paths,
+        daemon_paths=None,
+        directory="proc",
+        tty_number=34817,
+    ):
+        if daemon_paths is None:
+            daemon_paths = []
         proc_root = self.home / directory
-        process = proc_root / "123"
+        self.create_proc_process(
+            proc_root,
+            pid=123,
+            rollout_paths=rollout_paths,
+            tty_number=tty_number,
+            arguments=["codex"],
+        )
+        if daemon_paths:
+            self.create_proc_process(
+                proc_root,
+                pid=456,
+                rollout_paths=daemon_paths,
+                tty_number=0,
+                arguments=[
+                    "codex",
+                    "app-server",
+                    "--listen",
+                    "unix://",
+                    "--managed-daemon",
+                ],
+            )
+        return proc_root
+
+    def create_proc_process(
+        self, proc_root, pid, rollout_paths, tty_number, arguments
+    ):
+        process = proc_root / str(pid)
         descriptors = process / "fd"
         descriptors.mkdir(parents=True, exist_ok=True)
         (process / "comm").write_text("codex\n")
         (process / "stat").write_text(
-            f"123 (codex) S 1 123 123 {tty_number} 0 0\n"
+            f"{pid} (codex) S 1 {pid} {pid} {tty_number} 0 0\n"
+        )
+        (process / "cmdline").write_bytes(
+            b"\0".join(argument.encode() for argument in arguments) + b"\0"
         )
         for descriptor, path in enumerate(rollout_paths, 3):
             link = descriptors / str(descriptor)
             if not link.exists():
                 link.symlink_to(path.resolve())
-        return proc_root
+
+    def write_database(self, records):
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        connection.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                name TEXT,
+                title TEXT,
+                originator TEXT
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO threads (
+                id, rollout_path, updated_at, archived, name, title, originator
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            records,
+        )
+        connection.commit()
+        connection.close()
 
     def test_latest_rename_and_exact_compaction_records(self):
         session_id = str(uuid.uuid4())
@@ -319,6 +409,44 @@ class CodexSessionsTest(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertNotIn("\033[", result.stdout)
+
+    def test_managed_daemon_includes_only_codex_tui_sessions(self):
+        tui_id = str(uuid.uuid4())
+        desktop_id = str(uuid.uuid4())
+        tui_rollout = self.create_rollout(tui_id, [{"type": "session_meta"}])
+        desktop_rollout = self.create_rollout(
+            desktop_id, [{"type": "session_meta"}]
+        )
+        self.write_database(
+            [
+                (
+                    tui_id,
+                    str(tui_rollout),
+                    int(time.time()),
+                    0,
+                    "Daemon TUI session",
+                    "",
+                    "codex-tui",
+                ),
+                (
+                    desktop_id,
+                    str(desktop_rollout),
+                    int(time.time()),
+                    0,
+                    "Desktop session",
+                    "",
+                    "Codex Desktop",
+                ),
+            ]
+        )
+
+        result = self.run_script(
+            attached_paths=[], daemon_paths=[tui_rollout, desktop_rollout]
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Daemon TUI session", result.stdout)
+        self.assertNotIn("Desktop session", result.stdout)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux-specific test")
     def test_linux_ignores_codex_process_without_terminal(self):

@@ -36,6 +36,7 @@ class Session:
     archived: bool = False
     database_name: Optional[str] = None
     database_title: Optional[str] = None
+    database_originator: Optional[str] = None
     name: Optional[str] = None
     compactions: Optional[int] = None
 
@@ -124,6 +125,7 @@ def load_sessions_from_database(home: Path) -> List[Session]:
             "archived": "archived" if "archived" in columns else "0",
             "name": "name" if "name" in columns else "NULL",
             "title": "title" if "title" in columns else "NULL",
+            "originator": "originator" if "originator" in columns else "NULL",
         }
         query = """
             SELECT id, rollout_path,
@@ -131,7 +133,8 @@ def load_sessions_from_database(home: Path) -> List[Session]:
                    {updated_at_ms} AS updated_at_ms,
                    {archived} AS archived,
                    {name} AS name,
-                   {title} AS title
+                   {title} AS title,
+                   {originator} AS originator
               FROM threads
         """.format(**optional)
         rows = list(connection.execute(query))
@@ -159,6 +162,7 @@ def load_sessions_from_database(home: Path) -> List[Session]:
                 archived=bool(row["archived"]),
                 database_name=row["name"],
                 database_title=row["title"],
+                database_originator=row["originator"],
             )
         )
     return sessions
@@ -316,10 +320,16 @@ def linux_process_has_terminal(stat_path: Path) -> bool:
         return False
 
 
+def is_managed_daemon_command(arguments: Iterable[str]) -> bool:
+    argument_set = set(arguments)
+    return "app-server" in argument_set and "--managed-daemon" in argument_set
+
+
 def linux_terminal_attached_paths(
-    paths: Iterable[Path], proc_root: Path
+    paths: Iterable[Path], daemon_paths: Iterable[Path], proc_root: Path
 ) -> Optional[Set[Path]]:
     candidates = {path.resolve() for path in paths}
+    daemon_candidates = {path.resolve() for path in daemon_paths}
     if not candidates:
         return set()
     if not proc_root.is_dir():
@@ -342,7 +352,20 @@ def linux_terminal_attached_paths(
             continue
         if not command.startswith("codex"):
             continue
-        if not linux_process_has_terminal(process / "stat"):
+        has_terminal = linux_process_has_terminal(process / "stat")
+        is_managed_daemon = False
+        if not has_terminal:
+            try:
+                command_line = (process / "cmdline").read_bytes()
+            except OSError:
+                continue
+            arguments = [
+                argument.decode("utf-8", errors="replace")
+                for argument in command_line.split(b"\0")
+                if argument
+            ]
+            is_managed_daemon = is_managed_daemon_command(arguments)
+        if not has_terminal and not is_managed_daemon:
             continue
 
         try:
@@ -354,17 +377,22 @@ def linux_terminal_attached_paths(
                 target = descriptor.resolve(strict=True)
             except OSError:
                 continue
-            if target in candidates:
+            if target in candidates and (
+                has_terminal or target in daemon_candidates
+            ):
                 attached.add(target)
         if attached == candidates:
             break
     return attached
 
 
-def lsof_terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
+def lsof_terminal_attached_paths(
+    paths: Iterable[Path], daemon_paths: Iterable[Path]
+) -> Optional[Set[Path]]:
     lsof = shutil.which("lsof")
     ps = shutil.which("ps")
     path_list = [str(path.resolve()) for path in paths]
+    daemon_candidates = {path.resolve() for path in daemon_paths}
     if not lsof or not ps:
         return None
     if not path_list:
@@ -379,7 +407,7 @@ def lsof_terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
             text=True,
         )
         ps_result = subprocess.run(
-            [ps, "-axo", "pid=,tty="],
+            [ps, "-axo", "pid=,tty=,command="],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -390,11 +418,12 @@ def lsof_terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
     except subprocess.CalledProcessError:
         return None
 
-    terminals: Dict[int, str] = {}
+    processes: Dict[int, Tuple[str, List[str]]] = {}
     for line in ps_result.stdout.splitlines():
-        fields = line.strip().split(None, 1)
-        if len(fields) == 2 and fields[0].isdigit():
-            terminals[int(fields[0])] = fields[1]
+        fields = line.strip().split(None, 2)
+        if len(fields) >= 2 and fields[0].isdigit():
+            arguments = fields[2].split() if len(fields) == 3 else []
+            processes[int(fields[0])] = (fields[1], arguments)
 
     records: Dict[int, Tuple[str, Set[Path]]] = {}
     current_pid: Optional[int] = None
@@ -409,19 +438,26 @@ def lsof_terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
 
     attached: Set[Path] = set()
     for pid, (command, open_paths) in records.items():
-        terminal = terminals.get(pid, "??")
-        if command.startswith("codex") and terminal not in {"?", "??", "-"}:
+        terminal, arguments = processes.get(pid, ("??", []))
+        if not command.startswith("codex"):
+            continue
+        if terminal not in {"?", "??", "-"}:
             attached.update(open_paths)
+        elif is_managed_daemon_command(arguments):
+            attached.update(open_paths & daemon_candidates)
     return attached
 
 
-def terminal_attached_paths(paths: Iterable[Path]) -> Optional[Set[Path]]:
+def terminal_attached_paths(
+    paths: Iterable[Path], daemon_paths: Iterable[Path]
+) -> Optional[Set[Path]]:
     path_list = list(paths)
+    daemon_path_list = list(daemon_paths)
     if sys.platform.startswith("linux"):
         proc_root = Path(os.environ.get("CODEX_COMPACTIONS_PROC_ROOT", "/proc"))
-        return linux_terminal_attached_paths(path_list, proc_root)
+        return linux_terminal_attached_paths(path_list, daemon_path_list, proc_root)
     if sys.platform == "darwin":
-        return lsof_terminal_attached_paths(path_list)
+        return lsof_terminal_attached_paths(path_list, daemon_path_list)
     return None
 
 
@@ -529,7 +565,14 @@ def main() -> int:
 
     sessions = [session for session in sessions if not session.archived]
     sessions.sort(key=lambda session: session.updated_at, reverse=True)
-    attached = terminal_attached_paths(session.rollout_path for session in sessions)
+    daemon_paths = (
+        session.rollout_path
+        for session in sessions
+        if session.database_originator == "codex-tui"
+    )
+    attached = terminal_attached_paths(
+        (session.rollout_path for session in sessions), daemon_paths
+    )
     if attached is None:
         print(f"codex-compactions: {attachment_error()}", file=sys.stderr)
         return 1
