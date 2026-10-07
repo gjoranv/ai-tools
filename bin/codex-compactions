@@ -17,6 +17,23 @@ import unicodedata
 
 
 DEFAULT_LIMIT = 100
+GUIDANCE = {
+    "green": {
+        "range": "0-5",
+        "message": "No handover is suggested by the count.",
+    },
+    "yellow": {
+        "range": "6-11",
+        "message": (
+            "Prepare a handover before the session loses track of its goal, "
+            "constraints, or progress."
+        ),
+    },
+    "red": {
+        "range": "12+",
+        "message": "Hand over to a fresh session before doing work that relies on earlier details.",
+    },
+}
 ANSI_BOLD = "\033[1m"
 ANSI_GREEN = "\033[32m"
 ANSI_YELLOW = "\033[33m"
@@ -57,7 +74,15 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="colorize compaction counts (default: auto)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a machine-readable result for --session",
+    )
+    args = parser.parse_args()
+    if args.json and not args.session:
+        parser.error("--json requires --session")
+    return args
 
 
 def codex_home() -> Path:
@@ -514,13 +539,41 @@ def color_enabled(setting: str) -> bool:
 def color_compaction(value: str, count: Optional[int], enabled: bool) -> str:
     if not enabled or count is None:
         return value
-    if count <= 5:
-        color = ANSI_GREEN
-    elif count <= 11:
-        color = ANSI_YELLOW
-    else:
-        color = ANSI_RED
+    color = {
+        "green": ANSI_GREEN,
+        "yellow": ANSI_YELLOW,
+        "red": ANSI_RED,
+    }[compaction_range(count)]
     return f"{color}{value}{ANSI_RESET}"
+
+
+def compaction_range(count: int) -> str:
+    if count <= 5:
+        return "green"
+    if count <= 11:
+        return "yellow"
+    return "red"
+
+
+def print_session_json(session: Session) -> None:
+    count = session.compactions
+    status = compaction_range(count) if count is not None else None
+    now = datetime_module.datetime.now().astimezone()
+    print(
+        json.dumps(
+            {
+                "session_id": session.session_id,
+                "name": session.name,
+                "updated": relative_time(session.updated_at, now),
+                "compactions": count,
+                "range": status,
+                "guidance": GUIDANCE[status]["message"] if status else None,
+                "ranges": {
+                    name: value["range"] for name, value in GUIDANCE.items()
+                },
+            }
+        )
+    )
 
 
 def print_sessions(sessions: List[Session], use_color: bool) -> None:
@@ -616,7 +669,10 @@ def main() -> int:
     for session in selected:
         session.compactions = count_compactions(session.rollout_path)
 
-    print_sessions(selected, color_enabled(args.color))
+    if args.json:
+        print_session_json(selected[0])
+    else:
+        print_sessions(selected, color_enabled(args.color))
     return 0
 
 

@@ -11,6 +11,7 @@ import uuid
 
 
 SCRIPT = Path(__file__).parents[1] / "bin" / "codex-compactions"
+HOOK = Path(__file__).parents[1] / "hooks" / "codex-post-compact"
 
 
 class CodexSessionsTest(unittest.TestCase):
@@ -42,9 +43,8 @@ class CodexSessionsTest(unittest.TestCase):
             for record in records:
                 output.write(json.dumps(record) + "\n")
 
-    def run_script(
+    def script_environment(
         self,
-        *arguments,
         attached_paths=None,
         daemon_paths=None,
         extra_environment=None,
@@ -70,14 +70,52 @@ class CodexSessionsTest(unittest.TestCase):
             )
         if extra_environment:
             environment.update(extra_environment)
+        return environment
+
+    def run_script(
+        self,
+        *arguments,
+        attached_paths=None,
+        daemon_paths=None,
+        extra_environment=None,
+    ):
         return subprocess.run(
             [str(SCRIPT), *arguments],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=environment,
+            env=self.script_environment(
+                attached_paths, daemon_paths, extra_environment
+            ),
         )
+
+    def run_hook(self, event, attached_paths=None):
+        return subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=json.dumps(event),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.script_environment(attached_paths=attached_paths),
+        )
+
+    def create_hook_session(self, count):
+        session_id = str(uuid.uuid4())
+        self.create_rollout(
+            session_id, [{"type": "compacted"} for _ in range(count)]
+        )
+        self.write_index(
+            [
+                {
+                    "id": session_id,
+                    "thread_name": "Hook session",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        )
+        return session_id
 
     def create_attachment_tools(self, rollout_paths, daemon_paths=None):
         if daemon_paths is None:
@@ -391,6 +429,168 @@ class CodexSessionsTest(unittest.TestCase):
         self.assertRegex(result.stdout, "\033\\[32m\\s*5\033\\[0m")
         self.assertRegex(result.stdout, "\033\\[33m\\s*6\033\\[0m")
         self.assertRegex(result.stdout, "\033\\[31m\\s*12\033\\[0m")
+
+    def test_json_reports_selected_session_and_guidance(self):
+        sessions = {}
+        for name, count in (("Green", 5), ("Yellow", 6), ("Red", 12)):
+            session_id = str(uuid.uuid4())
+            self.create_rollout(
+                session_id,
+                [{"type": "session_meta"}]
+                + [{"type": "compacted"} for _ in range(count)],
+            )
+            sessions[name] = session_id
+        self.write_index(
+            [
+                {
+                    "id": session_id,
+                    "thread_name": name,
+                    "updated_at": "2026-01-01T00:00:00Z",
+                }
+                for name, session_id in sessions.items()
+            ]
+        )
+
+        expected_ranges = {"green": "0-5", "yellow": "6-11", "red": "12+"}
+        for name, count, status in (
+            ("Green", 5, "green"),
+            ("Yellow", 6, "yellow"),
+            ("Red", 12, "red"),
+        ):
+            with self.subTest(name=name):
+                result = self.run_script("--session", sessions[name], "--json")
+                self.assertEqual(0, result.returncode, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(sessions[name], report["session_id"])
+                self.assertEqual(name, report["name"])
+                self.assertEqual(count, report["compactions"])
+                self.assertEqual(status, report["range"])
+                self.assertEqual(expected_ranges, report["ranges"])
+                self.assertTrue(report["guidance"])
+
+        result = self.run_script("--json")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("--json requires --session", result.stderr)
+
+    def test_post_compact_reports_selected_session(self):
+        selected_id = str(uuid.uuid4())
+        other_id = str(uuid.uuid4())
+        self.create_rollout(
+            selected_id,
+            [{"type": "compacted"} for _ in range(6)],
+        )
+        self.create_rollout(
+            other_id,
+            [{"type": "compacted"} for _ in range(12)],
+        )
+        self.write_index(
+            [
+                {
+                    "id": selected_id,
+                    "thread_name": "Selected session",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "id": other_id,
+                    "thread_name": "Other session",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                },
+            ]
+        )
+
+        result = self.run_hook(
+            {
+                "hook_event_name": "PostCompact",
+                "session_id": selected_id,
+                "trigger": "auto",
+            }
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        message = json.loads(result.stdout)["systemMessage"]
+        self.assertEqual("", message.splitlines()[0])
+        self.assertEqual("── Compaction status ──", message.splitlines()[1])
+        self.assertEqual(
+            "🟡 6 compactions for this session, YELLOW range (6-11)",
+            message.splitlines()[2],
+        )
+        self.assertEqual(
+            "Prepare a handover before the session loses track of "
+            "its goal, constraints, or progress.",
+            message.splitlines()[3],
+        )
+        self.assertEqual("───────────────────────", message.splitlines()[4])
+        self.assertNotIn("\033[", message)
+        self.assertNotIn("Selected session", message)
+        self.assertNotIn("Other session", message)
+
+    def test_post_compact_formats_each_range(self):
+        for count, status, interval, symbol in (
+            (1, "GREEN", "0-5", "🟢"),
+            (6, "YELLOW", "6-11", "🟡"),
+            (12, "RED", "12+", "🔴"),
+        ):
+            with self.subTest(status=status):
+                session_id = self.create_hook_session(count)
+                result = self.run_hook(
+                    {"hook_event_name": "PostCompact", "session_id": session_id},
+                )
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                message = json.loads(result.stdout)["systemMessage"]
+                noun = "compaction" if count == 1 else "compactions"
+                lines = message.splitlines()
+                self.assertEqual("", lines[0])
+                count_line = 1 if status == "GREEN" else 2
+                self.assertEqual(
+                    f"{symbol} {count} {noun} for this session, "
+                    f"{status} range ({interval})",
+                    lines[count_line],
+                )
+                if status == "GREEN":
+                    self.assertEqual(2, len(lines))
+                else:
+                    self.assertEqual("── Compaction status ──", lines[1])
+                    self.assertEqual("───────────────────────", lines[4])
+                    self.assertEqual(5, len(lines))
+                self.assertNotIn("\033[", message)
+                self.assertNotIn("Hook session", message)
+
+    def test_post_compact_is_silent_for_unattached_or_invalid_session(self):
+        session_id = str(uuid.uuid4())
+        self.create_rollout(session_id, [{"type": "compacted"}])
+        event = {"hook_event_name": "PostCompact", "session_id": session_id}
+
+        for candidate, paths in (
+            (event, []),
+            ({"hook_event_name": "PostCompact"}, None),
+            ({"hook_event_name": "PreCompact", "session_id": session_id}, None),
+        ):
+            with self.subTest(candidate=candidate, paths=paths):
+                result = self.run_hook(candidate, attached_paths=paths)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("", result.stdout)
+
+    def test_post_compact_skips_subagent_with_attached_parent(self):
+        parent_id = str(uuid.uuid4())
+        child_id = str(uuid.uuid4())
+        self.create_rollout(
+            parent_id,
+            [{"type": "compacted"} for _ in range(12)],
+        )
+
+        result = self.run_hook(
+            {
+                "hook_event_name": "PostCompact",
+                "session_id": parent_id,
+                "agent_id": child_id,
+                "agent_type": "default",
+                "trigger": "auto",
+            }
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout)
 
     def test_auto_color_is_disabled_when_output_is_not_a_terminal(self):
         session_id = str(uuid.uuid4())
