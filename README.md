@@ -6,10 +6,10 @@ Tools and scripts related to AI agents.
 
 Run `bin/codex-compactions` for a quick summary of terminal-attached Codex
 sessions. It shows each session's human-readable name, last activity, and
-context compaction count. The optional PostCompact hook adds a timely report
-after each compaction, and the optional `codex-compactions` skill lets you ask
-for the count from within Codex. The hook and skill both query the CLI, and you
-can use all three together.
+context compaction count. Optional hooks report the count after each compaction
+and on the first prompt after resuming a session. The optional
+`codex-compactions` skill lets you ask for the count from within Codex. The hooks
+and skill all query the CLI, and you can use them together.
 
 The CLI reads Codex metadata and rollout files locally and makes no network
 requests.
@@ -58,9 +58,10 @@ Colors are disabled automatically when output is redirected or piped; use
 
 ### Automatic compaction reports
 
-An optional Codex PostCompact hook shows the current session's compaction count
-immediately after each compaction. Green reports use one line; yellow and red
-reports add handover guidance in a frame. For example:
+Optional Codex PostCompact and SessionStart hooks show the current session's
+compaction count after each compaction and on the first prompt after resuming a
+session. Both use the same script and message. Green reports use one line;
+yellow and red reports add handover guidance in a frame. For example:
 
 ```text
 ── Compaction status ──
@@ -72,15 +73,19 @@ Prepare a handover before the session loses track of its goal, constraints, or p
 The status symbol follows the same green, yellow, and red ranges described above.
 Its appearance depends on terminal emoji rendering; the range label remains
 explicit. If the count cannot be determined, the hook stays silent.
+A resume report repeats the current total; it does not indicate a new compaction.
 
-To install it, link the hook script from the repository root:
+To install the hook, link the hook script from the repository root:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-ln -sfn "$PWD/hooks/codex-post-compact" "$HOME/.local/bin/codex-post-compact"
+ln -sfn "$PWD/hooks/codex-compaction-status" "$HOME/.local/bin/codex-compaction-status"
 ```
 
-Add this entry to `~/.codex/hooks.json`, merging it with any existing hooks:
+Add these entries to `~/.codex/hooks.json`, preserving other hooks. If either
+event already runs this script under the old `codex-post-compact` name or the new
+`codex-compaction-status` name, keep that handler and add only the missing one.
+Codex runs every matching hook, so duplicate handlers produce duplicate reports.
 
 ```json
 {
@@ -90,7 +95,19 @@ Add this entry to `~/.codex/hooks.json`, merging it with any existing hooks:
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.local/bin/codex-post-compact",
+            "command": "python3 ~/.local/bin/codex-compaction-status",
+            "timeout": 35
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "^resume$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.local/bin/codex-compaction-status",
             "timeout": 35
           }
         ]
@@ -100,11 +117,14 @@ Add this entry to `~/.codex/hooks.json`, merging it with any existing hooks:
 }
 ```
 
-In Codex, run `/hooks`, review the command, and trust it. To test the hook, run
-`/compact` in a throwaway Codex session.
+In Codex, run `/hooks` to review and trust new or changed hook definitions. To
+test, run `/compact` in a throwaway Codex session. Then exit, resume it, and
+send a prompt to see the resume report.
 
-To remove the hook, delete the `PostCompact` entry from `~/.codex/hooks.json`
-and remove the `codex-post-compact` symlink from `~/.local/bin`.
+To remove the reports, delete the compaction status `PostCompact` entry and the
+`SessionStart` entry with matcher `^resume$` from `~/.codex/hooks.json`, then
+remove the `codex-compaction-status` symlink from `~/.local/bin` (or
+`codex-post-compact` for an existing installation).
 
 ### Ask within Codex with the codex-compactions skill
 

@@ -11,7 +11,8 @@ import uuid
 
 
 SCRIPT = Path(__file__).parents[1] / "bin" / "codex-compactions"
-HOOK = Path(__file__).parents[1] / "hooks" / "codex-post-compact"
+HOOK = Path(__file__).parents[1] / "hooks" / "codex-compaction-status"
+LEGACY_HOOK = Path(__file__).parents[1] / "hooks" / "codex-post-compact"
 
 
 class CodexSessionsTest(unittest.TestCase):
@@ -90,9 +91,9 @@ class CodexSessionsTest(unittest.TestCase):
             ),
         )
 
-    def run_hook(self, event, attached_paths=None):
+    def run_hook(self, event, attached_paths=None, hook=HOOK):
         return subprocess.run(
-            [sys.executable, str(HOOK)],
+            [sys.executable, str(hook)],
             input=json.dumps(event),
             check=False,
             stdout=subprocess.PIPE,
@@ -524,6 +525,17 @@ class CodexSessionsTest(unittest.TestCase):
         self.assertNotIn("Selected session", message)
         self.assertNotIn("Other session", message)
 
+    def test_legacy_hook_path_reports_the_same_status(self):
+        session_id = self.create_hook_session(6)
+        event = {"hook_event_name": "PostCompact", "session_id": session_id}
+
+        current = self.run_hook(event)
+        legacy = self.run_hook(event, hook=LEGACY_HOOK)
+
+        self.assertEqual(0, current.returncode, current.stderr)
+        self.assertEqual(0, legacy.returncode, legacy.stderr)
+        self.assertEqual(current.stdout, legacy.stdout)
+
     def test_post_compact_formats_each_range(self):
         for count, status, interval, symbol in (
             (1, "GREEN", "0-5", "🟢"),
@@ -532,12 +544,20 @@ class CodexSessionsTest(unittest.TestCase):
         ):
             with self.subTest(status=status):
                 session_id = self.create_hook_session(count)
-                result = self.run_hook(
+                messages = []
+                for event in (
                     {"hook_event_name": "PostCompact", "session_id": session_id},
-                )
-
-                self.assertEqual(0, result.returncode, result.stderr)
-                message = json.loads(result.stdout)["systemMessage"]
+                    {
+                        "hook_event_name": "SessionStart",
+                        "source": "resume",
+                        "session_id": session_id,
+                    },
+                ):
+                    result = self.run_hook(event)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    messages.append(json.loads(result.stdout)["systemMessage"])
+                self.assertEqual(messages[0], messages[1])
+                message = messages[0]
                 noun = "compaction" if count == 1 else "compactions"
                 lines = message.splitlines()
                 self.assertEqual("", lines[0])
@@ -565,6 +585,23 @@ class CodexSessionsTest(unittest.TestCase):
             (event, []),
             ({"hook_event_name": "PostCompact"}, None),
             ({"hook_event_name": "PreCompact", "session_id": session_id}, None),
+            (
+                {
+                    "hook_event_name": "SessionStart",
+                    "source": "startup",
+                    "session_id": session_id,
+                },
+                None,
+            ),
+            (
+                {
+                    "hook_event_name": "SessionStart",
+                    "source": "compact",
+                    "session_id": session_id,
+                },
+                None,
+            ),
+            ({"hook_event_name": "SessionStart", "session_id": session_id}, None),
         ):
             with self.subTest(candidate=candidate, paths=paths):
                 result = self.run_hook(candidate, attached_paths=paths)
@@ -579,18 +616,26 @@ class CodexSessionsTest(unittest.TestCase):
             [{"type": "compacted"} for _ in range(12)],
         )
 
-        result = self.run_hook(
+        for event in (
             {
                 "hook_event_name": "PostCompact",
                 "session_id": parent_id,
                 "agent_id": child_id,
                 "agent_type": "default",
                 "trigger": "auto",
-            }
-        )
-
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual("", result.stdout)
+            },
+            {
+                "hook_event_name": "SessionStart",
+                "source": "resume",
+                "session_id": parent_id,
+                "agent_id": child_id,
+                "agent_type": "default",
+            },
+        ):
+            with self.subTest(event=event["hook_event_name"]):
+                result = self.run_hook(event)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("", result.stdout)
 
     def test_auto_color_is_disabled_when_output_is_not_a_terminal(self):
         session_id = str(uuid.uuid4())
